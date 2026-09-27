@@ -1,0 +1,149 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Validate SUREFIRE-3459 on Windows
+
+on:
+  push:
+    branches: [surefire-3459-windows-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  rocksdb-ffm:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Zulu JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: '25.0.4+7'
+          architecture: x64
+          cache: maven
+
+      - name: Confirm affected JVM environment
+        shell: pwsh
+        run: |
+          java -version
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') {
+            throw 'The reported failure requires Windows x64'
+          }
+
+      - name: Build patched Surefire
+        run: mvn --batch-mode --no-transfer-progress -DskipTests install
+
+      - name: Check out affected project at the reported workaround commit
+        uses: actions/checkout@v7
+        with:
+          repository: dfa1/rocksdb-ffm
+          ref: d0c006ef3613f833903c47b299df8bddefe532ec
+          path: rocksdb-ffm
+          submodules: recursive
+
+      - name: Install Zig used by the affected project
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Use patched plugin with stack capture enabled
+        shell: pwsh
+        run: |
+          $path = 'rocksdb-ffm/pom.xml'
+          [xml]$pom = Get-Content $path -Raw
+          $ns = [System.Xml.XmlNamespaceManager]::new($pom.NameTable)
+          $ns.AddNamespace('m', 'http://maven.apache.org/POM/4.0.0')
+          $plugin = $pom.SelectSingleNode('//m:plugin[m:artifactId="maven-surefire-plugin"]', $ns)
+          if ($null -eq $plugin) { throw 'Surefire plugin configuration not found' }
+          $version = $plugin.SelectSingleNode('m:version', $ns)
+          $frames = $plugin.SelectSingleNode('m:configuration/m:stackTraceMaxFrames', $ns)
+          $argLine = $plugin.SelectSingleNode('m:configuration/m:argLine', $ns)
+          if ($version.InnerText -ne '3.6.0' -or $frames.InnerText -ne '0') {
+            throw 'Downstream baseline changed; validate the POM before running'
+          }
+          $version.InnerText = '3.6.1-SNAPSHOT'
+          $frames.InnerText = '15'
+          $argLine.InnerText = '@{argLine} --enable-native-access=ALL-UNNAMED'
+          $pom.Save($path)
+
+      - name: Control - StackWalker remains enabled
+        id: control
+        continue-on-error: true
+        shell: pwsh
+        working-directory: rocksdb-ffm
+        run: |
+          mvn --batch-mode --no-transfer-progress verify -Pall-natives "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" -Dsurefire.failIfNoSpecifiedTests=false *> "$env:RUNNER_TEMP/control.log"
+          exit $LASTEXITCODE
+
+      - name: Confirm the control reproduced the reported crash
+        shell: pwsh
+        run: |
+          if ('${{ steps.control.outcome }}' -ne 'failure') {
+            throw 'StackWalker control passed; the Windows failure was not reproduced'
+          }
+          $log = Get-Content "$env:RUNNER_TEMP/control.log" -Raw
+          if (-not $log.Contains('The forked VM terminated without properly saying goodbye')) {
+            throw 'Control failed for a reason other than the reported fork termination'
+          }
+          foreach ($test in @('CompactionFilterFactoryTest', 'CompactionFilterTest', 'EventNotifierTest')) {
+            if (-not $log.Contains($test)) { throw "Control log did not name $test" }
+          }
+
+      - name: Select legacy capture in the test JVM
+        shell: pwsh
+        run: |
+          $path = 'rocksdb-ffm/pom.xml'
+          [xml]$pom = Get-Content $path -Raw
+          $ns = [System.Xml.XmlNamespaceManager]::new($pom.NameTable)
+          $ns.AddNamespace('m', 'http://maven.apache.org/POM/4.0.0')
+          $plugin = $pom.SelectSingleNode('//m:plugin[m:artifactId="maven-surefire-plugin"]', $ns)
+          $argLine = $plugin.SelectSingleNode('m:configuration/m:argLine', $ns)
+          $argLine.InnerText = '@{argLine} --enable-native-access=ALL-UNNAMED -Dsurefire.stackTrace.disableStackWalker=true'
+          $pom.Save($path)
+
+      - name: Run affected tests with stack capture retained
+        shell: pwsh
+        working-directory: rocksdb-ffm
+        run: |
+          mvn --batch-mode --no-transfer-progress verify -Pall-natives "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" -Dsurefire.failIfNoSpecifiedTests=false *> "$env:RUNNER_TEMP/legacy.log"
+          exit $LASTEXITCODE
+
+      - name: Verify all affected test reports
+        shell: pwsh
+        run: |
+          foreach ($test in @('CompactionFilterFactoryTest', 'CompactionFilterTest', 'EventNotifierTest')) {
+            $reports = @(Get-ChildItem rocksdb-ffm -Recurse -Filter "TEST-*$test.xml" | Where-Object FullName -Match 'surefire-reports')
+            if ($reports.Count -ne 1) { throw "Expected one report for $test, found $($reports.Count)" }
+            [xml]$report = Get-Content $reports[0].FullName -Raw
+            $suite = $report.testsuite
+            if ([int]$suite.tests -lt 1 -or [int]$suite.failures -ne 0 -or [int]$suite.errors -ne 0) {
+              throw "$test did not pass: $($reports[0].FullName)"
+            }
+          }
+
+      - name: Save control and opt-out logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-3459-windows-logs
+          path: |
+            ${{ runner.temp }}/control.log
+            ${{ runner.temp }}/legacy.log
+          if-no-files-found: ignore
