@@ -89,7 +89,7 @@ jobs:
         shell: pwsh
         working-directory: rocksdb-ffm
         run: |
-          mvn --batch-mode --no-transfer-progress verify -Pall-natives "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/control.log"
+          mvn --batch-mode --no-transfer-progress verify "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/control.log"
           exit $LASTEXITCODE
 
       - name: Confirm the control reproduced the reported crash
@@ -122,7 +122,7 @@ jobs:
         shell: pwsh
         working-directory: rocksdb-ffm
         run: |
-          mvn --batch-mode --no-transfer-progress verify -Pall-natives "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/legacy.log"
+          mvn --batch-mode --no-transfer-progress verify "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/legacy.log"
           exit $LASTEXITCODE
 
       - name: Verify all affected test reports
