@@ -63,7 +63,13 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Use patched plugin with stack capture enabled
+      - name: Cache the Windows native build
+        uses: actions/cache@v6
+        with:
+          path: rocksdb-ffm/native/windows-x86_64/src/main/resources/native
+          key: rocksdb-3459-${{ hashFiles('rocksdb-ffm/rocksdb/CMakeLists.txt', 'rocksdb-ffm/scripts/build-rocksdb-windows.sh') }}-windows-x64
+
+      - name: Restore stack capture with the released 3.6.0 plugin
         shell: pwsh
         run: |
           $path = 'rocksdb-ffm/pom.xml'
@@ -78,7 +84,6 @@ jobs:
           if ($version.InnerText -ne '3.6.0' -or $frames.InnerText -ne '0') {
             throw 'Downstream baseline changed; validate the POM before running'
           }
-          $version.InnerText = '3.6.1-SNAPSHOT'
           $frames.InnerText = '15'
           $argLine.InnerText = '@{argLine} --enable-native-access=ALL-UNNAMED'
           $pom.Save($path)
@@ -89,7 +94,7 @@ jobs:
         shell: pwsh
         working-directory: rocksdb-ffm
         run: |
-          mvn --batch-mode --no-transfer-progress verify "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/control.log"
+          mvn --batch-mode --no-transfer-progress verify *> "$env:RUNNER_TEMP/control.log"
           exit $LASTEXITCODE
 
       - name: Confirm the control reproduced the reported crash
@@ -114,21 +119,29 @@ jobs:
           $ns = [System.Xml.XmlNamespaceManager]::new($pom.NameTable)
           $ns.AddNamespace('m', 'http://maven.apache.org/POM/4.0.0')
           $plugin = $pom.SelectSingleNode('//m:plugin[m:artifactId="maven-surefire-plugin"]', $ns)
+          $version = $plugin.SelectSingleNode('m:version', $ns)
           $argLine = $plugin.SelectSingleNode('m:configuration/m:argLine', $ns)
+          if ($version.InnerText -ne '3.6.0') { throw 'Baseline Surefire version changed unexpectedly' }
+          $version.InnerText = '3.6.1-SNAPSHOT'
           $argLine.InnerText = '@{argLine} --enable-native-access=ALL-UNNAMED -Dsurefire.stackTrace.disableStackWalker=true'
           $pom.Save($path)
 
-      - name: Run affected tests with stack capture retained
+      - name: Run full suite with stack capture retained
         shell: pwsh
         working-directory: rocksdb-ffm
         run: |
-          mvn --batch-mode --no-transfer-progress verify "-Dtest=CompactionFilterFactoryTest,CompactionFilterTest,EventNotifierTest" "-Dsurefire.failIfNoSpecifiedTests=false" *> "$env:RUNNER_TEMP/legacy.log"
+          mvn --batch-mode --no-transfer-progress verify *> "$env:RUNNER_TEMP/legacy.log"
           exit $LASTEXITCODE
 
       - name: Verify all affected test reports
         shell: pwsh
         run: |
+          $log = Get-Content "$env:RUNNER_TEMP/legacy.log" -Raw
+          if (-not $log.Contains('BUILD SUCCESS')) { throw 'Patched full-suite build did not complete successfully' }
           foreach ($test in @('CompactionFilterFactoryTest', 'CompactionFilterTest', 'EventNotifierTest')) {
+            if (-not $log.Contains("Running io.github.dfa1.rocksdbffm.$test")) {
+              throw "Patched run did not execute $test"
+            }
             $reports = @(Get-ChildItem rocksdb-ffm -Recurse -Filter "TEST-*$test.xml" | Where-Object FullName -Match 'surefire-reports')
             if ($reports.Count -ne 1) { throw "Expected one report for $test, found $($reports.Count)" }
             [xml]$report = Get-Content $reports[0].FullName -Raw
